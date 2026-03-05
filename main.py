@@ -1,13 +1,32 @@
-from fastapi import FastAPI, UploadFile, File
+from datetime import datetime
+from fastapi import Body, FastAPI, UploadFile, File
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-import os
+from pathlib import Path
+from typing import Any, Dict, List
+
+import json
+import shutil
 import uuid
+
+# Directories for datasets
+DATASET_DIR = "dataset"
+DATASET_SQUIRREL_DIR = Path(DATASET_DIR) / "squirrel"
+DATASET_NOT_DIR = Path(DATASET_DIR) / "not_squirrel"
 
 # Directory for image storage
 IMAGE_UPLOADS_DIR = "image_uploads"
+Path(IMAGE_UPLOADS_DIR).mkdir(parents=True, exist_ok=True)
+
+METADATA_PATH = Path(IMAGE_UPLOADS_DIR) / "metadata.json"
 
 app = FastAPI()
 app.mount("/images", StaticFiles(directory=IMAGE_UPLOADS_DIR), name="images")
+
+
+#######################################################################
+######################### ENDPOINTS ###################################
+#######################################################################
 
 
 # Simple server life check
@@ -16,38 +35,307 @@ def root():
     return {"status": "ok", "message": "FastAPI is running"}
 
 
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard(filter: str = "all"):
+    # Load records (from metadata.json)
+    records = load_metadata()
+    records.sort(key=lambda r: r.get("modified_epoch", 0), reverse=True)
+
+    # Optional filtering
+    if filter == "unlabeled":
+        records = [r for r in records if not r.get("label")]
+    elif filter == "squirrel":
+        records = [r for r in records if r.get("label") == "squirrel"]
+    elif filter == "not_squirrel":
+        records = [r for r in records if r.get("label") == "not_squirrel"]
+    else:
+        filter = "all"
+
+    # Limit for page performance
+    records = records[:48]
+
+    script = """
+    <script>
+    async function setLabel(recordId, label) {
+      const res = await fetch('/label', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ record_id: recordId, label: label })
+      });
+      const data = await res.json();
+      const el = document.getElementById('label-' + recordId);
+
+      if (data.status === 'ok') {
+        el.textContent = 'Label: ' + data.label;
+      } else {
+        el.textContent = 'Error: ' + (data.message || 'unknown');
+      }
+    }
+    </script>
+    """
+
+    def label_badge(label: str | None) -> str:
+        if label == "squirrel":
+            return "🐿️ squirrel"
+        if label == "not_squirrel":
+            return "🚫 not_squirrel"
+        return "❓ unlabeled"
+
+    cards = "\n".join(
+        f"""
+        <div style="display:flex; flex-direction:column; align-items:center; margin:8px; width:180px;">
+          <a href="{r.get('url')}" target="_blank">
+            <img src="{r.get('url')}" style="height:140px; border-radius:10px;" />
+          </a>
+
+          <div id="label-{r.get('id')}" style="font-size:12px; margin-top:6px; opacity:0.9;">
+            {label_badge(r.get("label"))}
+          </div>
+
+          <div style="margin-top:6px; display:flex; gap:6px;">
+            <button onclick="setLabel('{r.get('id')}', 'squirrel')">🐿️</button>
+            <button onclick="setLabel('{r.get('id')}', 'not_squirrel')">🚫</button>
+          </div>
+
+          <div style="font-size:10px; margin-top:6px; opacity:0.6; text-align:center;">
+            {r.get("saved_as")}
+          </div>
+        </div>
+        """
+        for r in records
+    )
+
+    html = f"""
+    <html>
+      <head>
+        <title>Squirrel AI Dashboard</title>
+        {script}
+      </head>
+      <body style="font-family: Arial; padding: 20px;">
+        <h1>🐿️ Squirrel AI Dashboard</h1>
+
+        <div style="margin: 12px 0;">
+          <strong>Filter:</strong>
+          <a href="/dashboard?filter=all">All</a> |
+          <a href="/dashboard?filter=unlabeled">Unlabeled</a> |
+          <a href="/dashboard?filter=squirrel">Squirrel</a> |
+          <a href="/dashboard?filter=not_squirrel">Not Squirrel</a>
+        </div>
+
+        <p>Showing {len(records)} records (newest first)</p>
+
+        <div style="display:flex; flex-wrap:wrap;">
+          {cards}
+        </div>
+      </body>
+    </html>
+    """
+    return html
+
+
+@app.post("/export_dataset")
+def export_dataset(overwrite: bool = False):
+    DATASET_SQUIRREL_DIR.mkdir(parents=True, exist_ok=True)
+    DATASET_NOT_DIR.mkdir(parents=True, exist_ok=True)
+
+    records = load_metadata()
+
+    exported = 0
+    skipped = 0
+
+    for r in records:
+        label = r.get("label")
+        saved_as = r.get("saved_as")
+
+        if label not in {"squirrel", "not_squirrel"} or not saved_as:
+            continue
+
+        src = Path(IMAGE_UPLOADS_DIR) / saved_as
+        if not src.exists():
+            skipped += 1
+            continue
+
+        dst_dir = DATASET_SQUIRREL_DIR if label == "squirrel" else DATASET_NOT_DIR
+        dst = dst_dir / saved_as
+
+        if dst.exists() and not overwrite:
+            skipped += 1
+            continue
+
+        shutil.copy2(src, dst)
+        exported += 1
+
+    return {"status": "ok", "exported": exported, "skipped": skipped}
+
+
+@app.get("/gallery")
+def gallery(limit: int = 20):
+    folder = Path(IMAGE_UPLOADS_DIR)
+    files = [p for p in folder.iterdir() if p.is_file()]
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    items = [
+        {
+            "filename": p.name,
+            "url": f"/images/{p.name}",
+            "modified_epoch": p.stat().st_mtime,
+        }
+        for p in files[:limit]
+    ]
+
+    return {"status": "ok", "count": len(items), "items": items}
+
+
+@app.post("/label")
+def label_image(
+    record_id: str = Body(...),
+    label: str = Body(...),
+):
+    if label not in {"squirrel", "not_squirrel"}:
+        return {
+            "status": "error",
+            "message": "label must be 'squirrel' or 'not_squirrel'",
+        }
+
+    ok = set_label(record_id, label)
+    if not ok:
+        return {"status": "error", "message": f"record_id not found: {record_id}"}
+
+    return {"status": "ok", "record_id": record_id, "label": label}
+
+
+@app.get("/latest")
+def latest():
+    folder = Path(IMAGE_UPLOADS_DIR)
+    files = [p for p in folder.iterdir() if p.is_file()]
+
+    if not files:
+        return {"response_status": "error", "message": "No images uploaded yet"}
+
+    newest = max(files, key=lambda p: p.stat().st_mtime)
+
+    return {
+        "response_status": "ok",
+        "filename": newest.name,
+        "url": f"/images/{newest.name}",
+        "modified_epoch": newest.stat().st_mtime,
+    }
+
+
+@app.get("/records")
+def records(limit: int = 50):
+    data = load_metadata()
+    data.sort(key=lambda r: r.get("modified_epoch", 0), reverse=True)
+    return {"status": "ok", "count": len(data[:limit]), "items": data[:limit]}
+
+
+@app.get("/stats")
+def stats():
+    records = load_metadata()
+    total = len(records)
+    squirrel = sum(1 for r in records if r.get("label") == "squirrel")
+    not_squirrel = sum(1 for r in records if r.get("label") == "not_squirrel")
+    labeled = squirrel + not_squirrel
+    unlabeled = total = labeled
+
+    return {
+        "status": "ok",
+        "total": total,
+        "labeled": labeled,
+        "unlabeled": unlabeled,
+        "squirrel": squirrel,
+        "not_squirrel": not_squirrel,
+    }
+
+
 # Upload images, save them to the image_uploads folder for model comparisons
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
-
-    # Ensure upload dir exists
-    os.makedirs(IMAGE_UPLOADS_DIR, exist_ok=True)
-
-    # Ensure filename exists
     if not file.filename:
-        return {
-            "response_status": "error",
-            "error_msg": "No filename provided",
-        }
+        return {"response_status": "error", "error_msg": "No filename provided"}
 
-    # Ensure a unique file path so that images will not
-    # be overwritten
-    extension = file.filename.split(".")[-1]
-    unique_file_name = f"{uuid.uuid4()}.{extension}"
+    saved_name = make_unique_filename(file.filename)
+    file_path = Path(IMAGE_UPLOADS_DIR) / saved_name
 
-    # Create file path
-    file_path = os.path.join(IMAGE_UPLOADS_DIR, unique_file_name)
-
-    # Read file contents
     contents = await file.read()
 
-    # Write to disk
     with open(file_path, "wb") as f:
         f.write(contents)
 
-    return {
-        "response_status": "success",
-        "saved_as": file.filename,
+    stat = file_path.stat()
+
+    record = {
+        "id": saved_name,  # use filename as id for now
+        "original_filename": file.filename,
+        "saved_as": saved_name,
         "content_type": file.content_type,
-        "location": file_path,
+        "size_bytes": stat.st_size,
+        "modified_epoch": stat.st_mtime,
+        "url": f"/images/{saved_name}",
+        "label": None,  # later: "squirrel" / "not_squirrel"
+        "prediction": None,  # later: {"squirrel": 0.92}
     }
+    add_record(record)
+
+    return {"status": "success", **record}
+
+
+################################################
+############## HELPER FUNCTIONS ################
+################################################
+
+
+def add_record(record: Dict[str, Any]) -> None:
+    records = load_metadata()
+    records.append(record)
+    save_metadata(records)
+
+
+def load_metadata() -> List[Dict[str, Any]]:
+    if not METADATA_PATH.exists():
+        return []
+    try:
+        with open(METADATA_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except json.JSONDecodeError:
+        # If file is corrupted/empty, start fresh (safe for now)
+        return []
+
+
+# Helper method for unique filename creation
+def make_unique_filename(original: str) -> str:
+    """
+    Returns: YYYYMMDD_HHMMSS_mmm_uuid8.ext
+    Example: 20260304_103355_214_a1b2c3d4.png
+    """
+    ext = Path(original).suffix.lower()  # includes the dot, e.g. ".png"
+    if not ext:
+        ext = ".bin"
+
+    # Timestamp (year-month-day_hour-min-sec_microsec) trimmed for readability
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:18]
+
+    uid = uuid.uuid4().hex[:8]
+    return f"{ts}_{uid}{ext}"
+
+
+def save_metadata(records: List[Dict[str, Any]]) -> None:
+    with open(METADATA_PATH, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2)
+
+
+def set_label(record_id: str, label: str) -> bool:
+    records = load_metadata()
+    updated = False
+
+    for r in records:
+        if r.get("id") == record_id:
+            r["label"] = label
+            updated = True
+            break
+
+    if updated:
+        save_metadata(records)
+
+    return updated
