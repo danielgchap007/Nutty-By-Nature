@@ -5,9 +5,12 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from typing import Any, Dict, List
 
+import cv2
 import json
 import shutil
+import tempfile
 import uuid
+
 
 # Directories for datasets
 DATASET_DIR = "dataset"
@@ -168,6 +171,55 @@ def export_dataset(overwrite: bool = False):
     return {"status": "ok", "exported": exported, "skipped": skipped}
 
 
+# Upload a video, extract frames with OpenCV, and save them as images + metadata
+# Upload video → extract frames → save as images for labeling
+@app.post("/upload_video")
+async def upload_video(
+    file: UploadFile = File(...),
+    every_n_seconds: float = 1.0,
+    max_frames: int | None = None,
+):
+    if not file.filename:
+        return {"status": "error", "message": "No filename provided"}
+
+    if not file.content_type or not file.content_type.startswith("video/"):
+        return {
+            "status": "error",
+            "message": f"Expected a video upload, got: {file.content_type}",
+        }
+
+    suffix = Path(file.filename).suffix or ".mp4"
+
+    with tempfile.NamedTemporaryFile(
+        mode="wb", delete=False, suffix=str(suffix)
+    ) as tmp:
+        temp_video_path = tmp.name
+        contents = await file.read()
+        tmp.write(contents)
+
+    try:
+        created_records = extract_frames_from_video(
+            video_path=temp_video_path,
+            every_n_seconds=every_n_seconds,
+            max_frames=max_frames,
+        )
+
+        return {
+            "status": "success",
+            "original_video_filename": file.filename,
+            "content_type": file.content_type,
+            "frames_created": len(created_records),
+            "every_n_seconds": every_n_seconds,
+            "max_frames": max_frames,
+            "records": created_records[:10],
+        }
+
+    finally:
+        temp_path = Path(temp_video_path)
+        if temp_path.exists():
+            temp_path.unlink()
+
+
 @app.get("/gallery")
 def gallery(limit: int = 20):
     folder = Path(IMAGE_UPLOADS_DIR)
@@ -236,7 +288,7 @@ def stats():
     squirrel = sum(1 for r in records if r.get("label") == "squirrel")
     not_squirrel = sum(1 for r in records if r.get("label") == "not_squirrel")
     labeled = squirrel + not_squirrel
-    unlabeled = total = labeled
+    unlabeled = total - labeled
 
     return {
         "status": "ok",
@@ -339,3 +391,70 @@ def set_label(record_id: str, label: str) -> bool:
         save_metadata(records)
 
     return updated
+
+
+def extract_frames_from_video(
+    video_path: str,
+    every_n_seconds: float = 1.0,
+    max_frames: int | None = None,
+) -> List[Dict[str, Any]]:
+    """
+    Extract frames from a video file, save them into IMAGE_UPLOADS_DIR,
+    create metadata records, and return the created records.
+    """
+    cap = cv2.VideoCapture(video_path)
+
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    source_fps = cap.get(cv2.CAP_PROP_FPS)
+    if source_fps <= 0:
+        cap.release()
+        raise RuntimeError("Could not determine video FPS")
+
+    frame_interval = max(int(source_fps * every_n_seconds), 1)
+
+    frame_index = 0
+    saved_count = 0
+    created_records: List[Dict[str, Any]] = []
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        if frame_index % frame_interval == 0:
+            saved_name = make_unique_filename(f"video_frame_{saved_count}.jpg")
+            file_path = Path(IMAGE_UPLOADS_DIR) / saved_name
+
+            success = cv2.imwrite(str(file_path), frame)
+            if not success:
+                frame_index += 1
+                continue
+
+            stat = file_path.stat()
+
+            record = {
+                "id": saved_name,
+                "original_filename": f"video_frame_{saved_count}.jpg",
+                "saved_as": saved_name,
+                "content_type": "image/jpeg",
+                "size_bytes": stat.st_size,
+                "modified_epoch": stat.st_mtime,
+                "url": f"/images/{saved_name}",
+                "label": None,
+                "prediction": None,
+                "source": "video_upload",
+            }
+
+            add_record(record)
+            created_records.append(record)
+            saved_count += 1
+
+            if max_frames is not None and saved_count >= max_frames:
+                break
+
+        frame_index += 1
+
+    cap.release()
+    return created_records
