@@ -11,6 +11,7 @@ import shutil
 import tempfile
 import uuid
 
+# TODO: Add dashboard auto-refresh or polling for when video / extract frames flow concluded
 
 # Directories for datasets
 DATASET_DIR = "dataset"
@@ -178,6 +179,8 @@ async def upload_video(
     file: UploadFile = File(...),
     every_n_seconds: float = 1.0,
     max_frames: int | None = None,
+    label: str | None = None,
+    identity: str | None = None,
 ):
     if not file.filename:
         return {"status": "error", "message": "No filename provided"}
@@ -186,6 +189,18 @@ async def upload_video(
         return {
             "status": "error",
             "message": f"Expected a video upload, got: {file.content_type}",
+        }
+
+    if label is not None and label not in {"squirrel", "not_squirrel"}:
+        return {
+            "status": "error",
+            "message": "Expected a binary of either squirrel or not squirrel",
+        }
+
+    if identity is not None and identity not in {"roughneck"}:
+        return {
+            "status": "error",
+            "message": "Invalid video identity",
         }
 
     suffix = Path(file.filename).suffix or ".mp4"
@@ -202,6 +217,8 @@ async def upload_video(
             video_path=temp_video_path,
             every_n_seconds=every_n_seconds,
             max_frames=max_frames,
+            label=label,
+            identity=identity,
         )
 
         return {
@@ -326,6 +343,7 @@ async def upload(file: UploadFile = File(...)):
         "url": f"/images/{saved_name}",
         "label": None,  # later: "squirrel" / "not_squirrel"
         "prediction": None,  # later: {"squirrel": 0.92}
+        "identity": None,
     }
     add_record(record)
 
@@ -397,6 +415,8 @@ def extract_frames_from_video(
     video_path: str,
     every_n_seconds: float = 1.0,
     max_frames: int | None = None,
+    label: str | None = None,
+    identity: str | None = None,
 ) -> List[Dict[str, Any]]:
     """
     Extract frames from a video file, save them into IMAGE_UPLOADS_DIR,
@@ -442,9 +462,10 @@ def extract_frames_from_video(
                 "size_bytes": stat.st_size,
                 "modified_epoch": stat.st_mtime,
                 "url": f"/images/{saved_name}",
-                "label": None,
+                "label": label,
                 "prediction": None,
                 "source": "video_upload",
+                "identity": identity,
             }
 
             add_record(record)
